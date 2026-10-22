@@ -26,6 +26,22 @@ public class DeduperTests
         Body = "body",
     };
 
+    private static Document Mail(
+        string id, string hash, string subject, string? from, string sentDate, string? body, params string[] to) => new()
+    {
+        DocId = id,
+        Custodian = "c1",
+        DocType = "email",
+        FileName = id + ".eml",
+        Sha256 = hash,
+        SizeBytes = 10,
+        SentDate = sentDate,
+        From = from,
+        To = new List<string>(to),
+        Subject = subject,
+        Body = body,
+    };
+
     private static Document Attachment(string id, string parentId, string hash, string fileName) => new()
     {
         DocId = id,
@@ -186,18 +202,23 @@ public class DeduperTests
             }
         }
 
-        // This batch has no identical email hashes, and cross-mailbox dedup is
-        // intentionally not implemented, so both mailbox copies stay.
-        Assert.Contains("DOC-000001", emitted.Keys);
-        Assert.Contains("DOC-000009", emitted.Keys);
-        Assert.Contains("DOC-000010", emitted.Keys);
-        Assert.Contains("DOC-000011", emitted.Keys);
-
-        // Loose-file hash dedup is unchanged: mlee's copy of policy.docx is still omitted.
+        Assert.Equal(new[]
+        {
+            "DOC-000001", "DOC-000002", "DOC-000003", "DOC-000004", "DOC-000005",
+            "DOC-000006", "DOC-000007", "DOC-000008", "DOC-000012", "DOC-000014",
+            "DOC-000015", "DOC-000016",
+        }, result.Rows.Select(r => r.DocId).ToArray());
+        Assert.DoesNotContain(result.Rows, r => r.DocId is "DOC-000009" or "DOC-000010" or "DOC-000011" or "DOC-000013");
         Assert.Contains("DOC-000008", emitted.Keys);
-        Assert.DoesNotContain("DOC-000013", emitted.Keys);
-        Assert.Equal(15, result.Rows.Count);
-        Assert.Equal(1, result.Suppressed);
+        Assert.Equal("2024-03-05T19:22:00Z", emitted["DOC-000002"].SentDate);
+        Assert.Equal("DOC-000001", emitted["DOC-000002"].FamilyId);
+        Assert.Equal(12, result.Rows.Count);
+        Assert.Equal(4, result.Suppressed);
+
+        var csv = LoadFileWriter.ToCsv(result.Rows);
+        Assert.StartsWith(LoadFileWriter.Header + "\n", csv);
+        foreach (var line in csv.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            Assert.Equal(8, line.Split(',').Length);
     }
 
     [Fact]
@@ -345,6 +366,208 @@ public class DeduperTests
                 Assert.Equal(ids, theseIds);
                 Assert.Equal(csv, thisCsv);
             }
+        }
+    }
+
+    [Fact]
+    public void CrossMailboxEmail_DifferentHashAndCasing_CollapsesToSmallestDocId()
+    {
+        var later = Email("Z-copy", "hash-z");
+        later.From = "John.Smith@example.com";
+        later.SentDate = "2024-03-05T19:22:00Z";
+        later.Subject = "Q3 budget review";
+        later.Body = "Hi\r\nthere";
+        later.To = new List<string> { "Maria.Lee@example.com" };
+        var earlier = Email("A-copy", "hash-a");
+        earlier.From = "john.smith@example.com";
+        earlier.SentDate = "2024-03-05T14:22:00-05:00";
+        earlier.Subject = "  Q3 Budget Review  ";
+        earlier.Body = "Hi\nthere";
+        earlier.To = new List<string> { "maria.lee@example.com" };
+        var attachment = Attachment("M-file", "A-copy", "pdf", "budget.pdf");
+
+        DedupResult? first = null;
+        foreach (var docs in new[]
+        {
+            new List<Document> { later, earlier, attachment },
+            new List<Document> { attachment, earlier, later },
+        })
+        {
+            var result = Deduper.Run(new Batch { Documents = docs });
+            Assert.Equal(new[] { "A-copy", "M-file" }, result.Rows.Select(r => r.DocId).ToArray());
+            Assert.Equal(1, result.Suppressed);
+            Assert.Equal("A-copy", result.Rows.Single(r => r.DocId == "M-file").ParentId);
+            Assert.Equal("2024-03-05T19:22:00Z", result.Rows.Single(r => r.DocId == "A-copy").SentDate);
+            var csv = LoadFileWriter.ToCsv(result.Rows);
+            if (first == null)
+                first = result;
+            else
+                Assert.Equal(LoadFileWriter.ToCsv(first.Rows), csv);
+        }
+    }
+
+    [Fact]
+    public void SimilarSubjects_DoNotMergeDistinctMessages()
+    {
+        var original = Mail("A", "h1", "Q3 budget review", "john.smith@example.com", "2024-03-05T19:22:00Z", "body", "maria.lee@example.com");
+        var reply = Mail("B", "h2", "Re: Q3 budget review", "john.smith@example.com", "2024-03-05T19:22:00Z", "body", "maria.lee@example.com");
+        var otherSender = Mail("C", "h3", "Q3 budget review", "ray.kim@example.com", "2024-03-05T19:22:00Z", "body", "maria.lee@example.com");
+        var otherInstant = Mail("D", "h4", "Q3 budget review", "john.smith@example.com", "2024-03-05T19:22:01Z", "body", "maria.lee@example.com");
+        var otherBody = Mail("E", "h5", "Q3 budget review", "john.smith@example.com", "2024-03-05T19:22:00Z", "body plus", "maria.lee@example.com");
+        var otherOrder = Mail("F", "h6", "Q3 budget review", "john.smith@example.com", "2024-03-05T19:22:00Z", "body", "ray.kim@example.com", "maria.lee@example.com");
+        var reversed = Mail("G", "h7", "Q3 budget review", "john.smith@example.com", "2024-03-05T19:22:00Z", "body", "maria.lee@example.com", "ray.kim@example.com");
+
+        var result = Deduper.Run(new Batch
+        {
+            Documents = new() { original, reply, otherSender, otherInstant, otherBody, otherOrder, reversed },
+        });
+
+        Assert.Equal(7, result.Rows.Count);
+        Assert.Equal(0, result.Suppressed);
+    }
+
+    [Fact]
+    public void IncompleteEmailIdentity_DoesNotMergeDifferentHashes()
+    {
+        var missingFromA = Mail("A", "h1", "same", "   ", "2024-03-05T19:22:00Z", "body", "a@example.com");
+        var missingFromB = Mail("B", "h2", "same", null, "2024-03-05T19:22:00Z", "body", "a@example.com");
+        var missingToA = Mail("C", "h3", "same", "a@example.com", "2024-03-05T19:22:00Z", "body");
+        missingToA.To = null;
+        var missingToB = Mail("D", "h4", "same", "a@example.com", "2024-03-05T19:22:00Z", "body");
+        missingToB.To = null;
+        var missingSubject = Mail("E", "h5", "same", "a@example.com", "2024-03-05T19:22:00Z", "body", "a@example.com");
+        missingSubject.Subject = null;
+        var missingBody = Mail("F", "h6", "same", "a@example.com", "2024-03-05T19:22:00Z", "body", "a@example.com");
+        missingBody.Body = null;
+
+        var result = Deduper.Run(new Batch
+        {
+            Documents = new() { missingFromA, missingFromB, missingToA, missingToB, missingSubject, missingBody },
+        });
+
+        Assert.Equal(new[] { "A", "B", "C", "D", "E", "F" }, result.Rows.Select(r => r.DocId).ToArray());
+        Assert.Equal(0, result.Suppressed);
+    }
+
+    [Fact]
+    public void FractionalSecondsAlone_DoNotMerge()
+    {
+        var earlier = Mail("A", "h1", "subject", "a@example.com", "2024-03-05T19:22:00.100Z", "body", "b@example.com");
+        var later = Mail("B", "h2", "subject", "a@example.com", "2024-03-05T19:22:00.200Z", "body", "b@example.com");
+
+        var result = Deduper.Run(new Batch { Documents = new() { later, earlier } });
+
+        Assert.Equal(new[] { "A", "B" }, result.Rows.Select(r => r.DocId).ToArray());
+        Assert.Equal(0, result.Suppressed);
+        Assert.All(result.Rows, row => Assert.Equal("2024-03-05T19:22:00Z", row.SentDate));
+    }
+
+    [Fact]
+    public void EquivalentFractionalInstants_WithDifferentOffsets_Merge()
+    {
+        var zulu = Mail("Z-copy", "hz", "subject", "a@example.com", "2024-03-05T19:22:00.500Z", "body", "b@example.com");
+        var offset = Mail("A-copy", "ho", "subject", "a@example.com", "2024-03-05T14:22:00.500-05:00", "body", "b@example.com");
+
+        var result = Deduper.Run(new Batch { Documents = new() { zulu, offset } });
+
+        var row = Assert.Single(result.Rows);
+        Assert.Equal("A-copy", row.DocId);
+        Assert.Equal(1, result.Suppressed);
+        Assert.Equal("2024-03-05T19:22:00Z", row.SentDate);
+    }
+
+    [Fact]
+    public void FractionalSentDate_TruncatesForOutput_AndDoesNotMergeDistinctInstants()
+    {
+        var first = Mail("A", "h1", "subject", "a@example.com", "2024-03-05T19:22:00.900Z", "body", "b@example.com");
+        var second = Mail("B", "h2", "subject", "a@example.com", "2024-03-05T14:22:00.100-05:00", "body", "b@example.com");
+
+        var result = Deduper.Run(new Batch { Documents = new() { first, second } });
+
+        Assert.Equal(new[] { "A", "B" }, result.Rows.Select(r => r.DocId).ToArray());
+        Assert.All(result.Rows, row => Assert.Equal("2024-03-05T19:22:00Z", row.SentDate));
+    }
+
+    [Fact]
+    public void ParentCycle_ThrowsInsteadOfLooping()
+    {
+        var batch = new Batch
+        {
+            Documents = new()
+            {
+                Attachment("A", "B", "h1", "a.bin"),
+                Attachment("B", "A", "h2", "b.bin"),
+            },
+        };
+
+        Assert.Throws<InvalidOperationException>(() => Deduper.Run(batch));
+    }
+
+    [Fact]
+    public void Csv_QuotesCommaQuoteAndLineBreaks_WithoutChangingPlainFields()
+    {
+        var plain = new LoadFileRow
+        {
+            DocId = "D", FamilyId = "F", ParentId = "", Custodian = "smith",
+            DocType = "loose", FileName = "Q3 budget review.eml", SentDate = "", Hash = "H",
+        };
+        var special = new LoadFileRow
+        {
+            DocId = "D2", FamilyId = "F2", ParentId = "", Custodian = "smith, jr",
+            DocType = "loose", FileName = "say\"hello\".txt", SentDate = "", Hash = "H",
+        };
+        var broken = new LoadFileRow
+        {
+            DocId = "D3", FamilyId = "F3", ParentId = "", Custodian = "smith",
+            DocType = "loose", FileName = "a\r\nb", SentDate = "", Hash = "H",
+        };
+
+        var plainCsv = LoadFileWriter.ToCsv(new[] { plain });
+        Assert.Equal(LoadFileWriter.Header + "\nD,F,,smith,loose,Q3 budget review.eml,,H\n", plainCsv);
+
+        var specialCsv = LoadFileWriter.ToCsv(new[] { special, broken });
+        Assert.Contains("\"smith, jr\"", specialCsv, StringComparison.Ordinal);
+        Assert.Contains("\"say\"\"hello\"\".txt\"", specialCsv, StringComparison.Ordinal);
+        Assert.Contains("\"a\r\nb\"", specialCsv, StringComparison.Ordinal);
+        Assert.StartsWith(LoadFileWriter.Header + "\n", specialCsv);
+    }
+
+    [Fact]
+    public void Write_StoresTheSameTextAsToCsv()
+    {
+        var rows = new[]
+        {
+            new LoadFileRow
+            {
+                DocId = "D", FamilyId = "F", ParentId = "", Custodian = "smith, jr",
+                DocType = "loose", FileName = "say\"hello\".txt", SentDate = "", Hash = "H",
+            },
+            new LoadFileRow
+            {
+                DocId = "D2", FamilyId = "F2", ParentId = "", Custodian = "smith",
+                DocType = "loose", FileName = "a\nb", SentDate = "", Hash = "H",
+            },
+        };
+        var expected = LoadFileWriter.ToCsv(rows);
+        var path = Path.Combine(Path.GetTempPath(), "dedup-write-" + Guid.NewGuid().ToString("N") + ".csv");
+        try
+        {
+            LoadFileWriter.Write(path, rows);
+            var bytes = File.ReadAllBytes(path);
+            var text = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false).GetString(bytes);
+
+            Assert.Equal(expected, text);
+            Assert.Equal(expected, File.ReadAllText(path));
+            Assert.StartsWith(LoadFileWriter.Header + "\n", text);
+            Assert.Contains("\"smith, jr\"", text, StringComparison.Ordinal);
+            Assert.Contains("\"say\"\"hello\"\".txt\"", text, StringComparison.Ordinal);
+            Assert.Contains("\"a\nb\"", text, StringComparison.Ordinal);
+            Assert.DoesNotContain('\uFEFF', text);
+        }
+        finally
+        {
+            if (File.Exists(path))
+                File.Delete(path);
         }
     }
 

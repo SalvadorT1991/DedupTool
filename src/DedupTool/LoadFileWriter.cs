@@ -17,9 +17,14 @@ public static class LoadFileWriter
         sb.Append(Header).Append('\n');
         foreach (var r in rows)
         {
-            sb.Append(string.Join(",",
-                r.DocId, r.FamilyId, r.ParentId, r.Custodian,
-                r.DocType, r.FileName, r.SentDate, r.Hash)).Append('\n');
+            sb.Append(Field(r.DocId)).Append(',')
+                .Append(Field(r.FamilyId)).Append(',')
+                .Append(Field(r.ParentId)).Append(',')
+                .Append(Field(r.Custodian)).Append(',')
+                .Append(Field(r.DocType)).Append(',')
+                .Append(Field(r.FileName)).Append(',')
+                .Append(Field(r.SentDate)).Append(',')
+                .Append(Field(r.Hash)).Append('\n');
         }
         return sb.ToString();
     }
@@ -27,5 +32,17 @@ public static class LoadFileWriter
     public static void Write(string path, IEnumerable<LoadFileRow> rows)
     {
         File.WriteAllText(path, ToCsv(rows));
+    }
+
+    /// <summary>
+    /// Quote a field only when it contains a comma, quote, or line break.
+    /// Internal quotes are doubled. Fields without those characters are unchanged.
+    /// </summary>
+    private static string Field(string? value)
+    {
+        value ??= "";
+        if (value.IndexOfAny(new[] { ',', '"', '\r', '\n' }) < 0)
+            return value;
+        return "\"" + value.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
     }
 }
