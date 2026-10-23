@@ -1,5 +1,5 @@
 # Deduplication algorithm review
-_Exported on 10/22/2026 at 16:00:44 CST from Cursor (3.26.16)_
+_Exported on 10/22/2026 at 16:22:29 CST from Cursor (3.26.16)_
 
 ---
 
@@ -627,4 +627,140 @@ The safe addition is tests, not a new serializer:
 - Split the header and each sample data line on `\n`, then on comma, and require exactly 8 fields. Require no `\r` in that text. This locks the contract the sample actually meets, which `StartsWith` does not.
 - One characterization test each for a comma, a quote, a CR, and an LF, asserting today’s raw `string.Join` text. That makes a later quoting change visible. It does not define the eventual ingest rule.
 - Hold the desired encoded form until the ingest team says whether a quoted field is accepted. Do not treat RFC 4180 as that answer.
+
+---
+
+**User**
+
+You are working inside the existing DedupTool repository. Make changes directly in the local workspace. Follow `SPEC.md` as the source of truth. Do not ask the user to paste source code into an external service.
+
+## Goal
+Implement cross-mailbox email deduplication according to section 3.3 while preserving family integrity and deterministic output.
+
+## Before changing code
+1. Read `SPEC.md`, `DECISIONS.md`, `README.md`, all source files, and existing tests.
+2. Understand the current models and how JSON fields are deserialized.
+3. Identify any contradictions between global deduplication, complete email families, and each custodian's self-contained production set. Do not silently ignore these constraints.
+4. Make the smallest safe set of changes and explain the design decisions in `DECISIONS.md`.
+
+## Email identity
+Emails collected from different mailboxes can represent the same message even when their raw SHA-256 hashes differ due to header encoding, casing, or line endings.
+
+Implement a deterministic email identity key using only fields available in the input schema. At minimum, evaluate:
+- Sender address normalized case-insensitively.
+- SentDate normalized to a UTC instant, respecting the explicit ISO-8601 offset.
+- Subject normalized for casing and surrounding whitespace.
+- Plain-text body normalized for CRLF/LF line endings and consistent whitespace handling.
+- Recipients normalized case-insensitively and sorted deterministically if the specification supports treating recipient order as irrelevant.
+
+Do not use filename, custodian, or raw email SHA-256 as the sole email identity. Do not assume that `Re:` messages are duplicates merely because their subjects match. Avoid overly aggressive normalization that could merge distinct messages. Document the chosen normalization policy and its limitations.
+
+## Family integrity
+- If an email is retained, retain all attachments in its parent chain, including nested attachments.
+- Do not deduplicate attachment rows in a way that strips an attachment from a retained family.
+- Ensure nested parent chains are handled safely and cycles do not cause infinite loops.
+- Choose retained representatives deterministically, independent of input document order.
+
+## Custodian completeness
+`SPEC.md` requires each custodian's production set to be complete and self-contained. Analyze how this requirement interacts with global cross-mailbox email deduplication.
+Do not invent an undocumented policy. Implement the interpretation best supported by the specification and clearly document any unavoidable trade-off. If both requirements cannot be satisfied by a single global CSV row set, explain the conflict and choose the least destructive, specification-consistent behavior.
+
+## Tests
+Add or update automated tests to cover:
+1. Same email with different raw hashes, sender casing, equivalent time zones, and CRLF versus LF body line endings.
+2. Different emails with similar subjects but different senders, timestamps, or bodies must not be incorrectly merged.
+3. Input order does not change the output.
+4. A retained email keeps all of its attachments.
+5. Nested attachments and parent-chain safety.
+6. Existing loose-file deduplication by SHA-256 remains correct.
+7. Shared attachment hashes do not remove attachments from otherwise retained families.
+8. Invalid or missing email identity fields are handled predictably, without accidental merging.
+9. The sample batch behavior is explicitly tested.
+
+## CSV and timestamps
+Review the CSV writer against `SPEC.md`. Preserve the exact required header and column order. Properly escape CSV fields containing commas, quotes, or newlines according to standard CSV rules if compatible with the required format. Accept ISO-8601 timestamps with explicit offsets, including fractional seconds if supported by the schema, and emit the specified UTC representation consistently.
+
+## Performance and determinism
+- Avoid unnecessary nested scans; use dictionaries or hash sets where appropriate.
+- Keep the implementation practical for batches of up to approximately 2 million documents.
+- Avoid reliance on input ordering, current culture, local machine timezone, or nondeterministic collection iteration.
+
+## Validation
+1. Run `dotnet test`.
+2. Run `dotnet build`.
+3. Run the CLI against `data/batch-sample.json` and write the generated CSV to a temporary output file.
+4. Verify the exact CSV header and sample output counts.
+5. Inspect `git diff` to ensure only intentional source, test, and documentation changes are present.
+6. Do not commit or push anything.
+7. Report the commands executed, test results, sample counts, changed files, assumptions, and remaining limitations honestly.
+
+Do not claim all requirements are satisfied if a requirement remains unresolved. Preserve the existing project structure and .NET target framework.
+
+---
+
+**Cursor**
+
+I’ll read the spec, decisions, and current code first so cross-mailbox dedup follows the existing family and ordering rules instead of inventing a second policy.
+
+Section 3.3 and section 4 cannot both be true in one CSV: a duplicate mailbox copy has to be omitted, and the file has only one custodian column. I’ll suppress the whole duplicate family, keep the ordinally smallest email with its attachments, and record that trade-off.
+
+Cross-mailbox copies now collapse to one family. `dotnet test` passed **22 tests, 0 failed, 0 skipped** (96 ms). `dotnet build` finished with **0 warnings and 0 errors**. The sample command exited 0 and printed `batch-sample: 16 documents in, 12 out, 4 suppressed as duplicates.`
+
+The header is `DocID,FamilyID,ParentID,Custodian,DocType,FileName,SentDate,Hash`. The 12 rows are DOC-000001 through DOC-000008, then DOC-000012, DOC-000014, DOC-000015, and DOC-000016. DOC-000001 is kept with both attachments. DOC-000009 and its two attachments are omitted because that message matches DOC-000001 after address case, UTC instant, and line-ending normalization, and `DOC-000001` is the smaller id. DOC-000004 still has `vendor-report.pdf`. The reply DOC-000012 stays. DOC-000013 is still the omitted loose file. Nothing was committed or pushed. `git status` shows only `DECISIONS.md`, `src/DedupTool/Deduper.cs`, `src/DedupTool/LoadFileWriter.cs`, and `test/DedupTool.Tests/DeduperTests.cs`.
+
+Two top-level emails match when `from`, `subject`, and each `to` entry are trimmed and lowercased with the invariant culture, `sentDate` is the same UTC instant, and `body` matches after CR/CRLF become LF and the ends are trimmed. Recipient order is kept, because the spec does not say order is irrelevant. `Re:` and `FW:` are not removed. File name, custodian, and raw `sha256` are not that key. A missing or blank `from`, a null `subject`, `body`, or `to`, or a `sentDate` without an explicit zone does not form a key, so those emails are not merged unless the raw hashes match. The survivor in each class is still the ordinal-minimum `DocID`, and rows are still sorted that way. A kept email keeps every descendant. A parent cycle throws.
+
+Section 4 is not satisfied. The CSV cannot name both custodians, so mlee's copy of the Q3 email is gone with its attachments, and mlee's `policy.docx` is still gone. Keeping both copies would ignore section 3.3. One complete family is the smaller loss, and `DECISIONS.md` says so.
+
+Also still limited: a display name will not match a bare address, a reordered recipient list will not match, and a body change other than line endings or surrounding whitespace will not match. Fractional timestamps are accepted and truncated toward zero to a whole second, so `19:22:00.900Z` stays `19:22:00Z`. Different fractions remain different messages. Fields are quoted only when they contain a comma, quote, or line break. That is an assumption that the ingest job accepts quotes. The spec does not name RFC 4180. This sample's plain fields stay unquoted. The tests compare `ToCsv` text. They do not compare the bytes `File.WriteAllText` writes to disk.
+
+---
+
+**User**
+
+Perform a final specification-compliance review of the current DedupTool implementation. Do not commit or push.
+
+1. Re-read SPEC.md, DECISIONS.md, and the current implementation and tests.
+2. Verify that email identity compares the full UTC instant, including fractional seconds. Do not truncate timestamps before identity comparison. Add tests for timestamps that differ only by fractional seconds and for equivalent timestamps with different offsets.
+3. Review the contradiction between global email deduplication (section 3.3) and complete self-contained custodian productions (section 4). Determine whether the current single-CSV design can satisfy both. Do not silently change behavior or claim compliance if it cannot. Document the trade-off and any clarification required from the assessment owner.
+4. Review CSV escaping and newline behavior against the exact load-file requirements. Add tests for commas, quotes, embedded newlines, and the actual file-writing path, not only ToCsv string output.
+5. Verify that malformed or missing identity fields cannot accidentally merge unrelated emails.
+6. Check determinism, family integrity, nested attachments, cycle detection, and behavior independent of input order.
+7. Review algorithmic complexity for batches of approximately 2 million documents; avoid quadratic comparisons.
+8. Run dotnet test, dotnet build, and the sample CLI command. Report exact results and all unresolved requirements.
+9. Do not change requirements or invent assumptions. Make only justified code/test/documentation changes. Do not commit or push.
+
+At the end, provide a concise compliance table mapping each requirement in SPEC.md to implementation evidence, tests, and any unresolved limitation.
+
+---
+
+**Cursor**
+
+I’ll re-read the spec, decisions, and current tests first, then add only the checks that are still missing: full-precision identity, file-level CSV output, and a complexity pass that stays linear.
+
+Identity already uses the full UTC tick count, and output truncation happens only when the CSV date is formatted. I’ll lock that with tests, record that one CSV cannot satisfy both section 3.3 and section 4, and memoize parent walks so a long chain stays linear.
+
+A single CSV cannot satisfy both section 3.3 and section 4. Behavior was left as global omission of the duplicate family. `dotnet test` passed **25 tests, 0 failed, 0 skipped** (94 ms). `dotnet build` finished with **0 warnings and 0 errors**. The sample command exited 0 and printed `batch-sample: 16 documents in, 12 out, 4 suppressed as duplicates.` The header is `DocID,FamilyID,ParentID,Custodian,DocType,FileName,SentDate,Hash`, followed by 12 data rows. Nothing was committed or pushed.
+
+Email identity already stored `ToUniversalTime().Ticks` before the CSV second is truncated. Two new tests lock that. `19:22:00.100Z` and `19:22:00.200Z` both stay in the file and both print `2024-03-05T19:22:00Z`. `19:22:00.500Z` and `14:22:00.500-05:00` collapse to `A-copy`, and the printed date is still `2024-03-05T19:22:00Z`. Null `subject` and null `body` now sit with the existing missing-field case: those emails are not merged when their hashes differ. `Write` was checked by reading the temp file's bytes back and comparing them with `ToCsv`, including a comma, a doubled quote, and an embedded newline. Parent walks are memoized, so cost follows the number of documents and links rather than a pairwise comparison. That was not timed on a two-million-document batch.
+
+Section 4 remains unmet. DOC-000009 and its attachments are omitted with mlee, and DOC-000013 is still omitted. The header cannot name both custodians. `DECISIONS.md` asks the assessment owner whether a severed custodian must still receive that duplicate family. Quoted fields are still an assumption: the spec never mentions them, and the ingest job has not said it accepts quotes.
+
+| Spec | Evidence | Tests | Limitation |
+|---|---|---|---|
+| 1. Same content once, with its context | Kept family is complete; duplicate family is omitted | Sample ids; attachment and nested tests | Section 4 copies are not produced |
+| 2. JSON document fields | Case-insensitive deserialize in `Program.Main` | Sample file is loaded by tests | No separate test for a missing parent |
+| 3.1 Loose files, same `sha256` | Global hash class, smallest `DocID` | `IdenticalLooseDocuments_SecondIsSuppressed`; sample omits DOC-000013 | Losing custodian is the section 4 gap |
+| 3.2 Attachments, same `sha256` | Not applied | DOC-000004 keeps `vendor-report.pdf` | Conflicts with 3.5; 3.5 was chosen |
+| 3.3 Mailbox copies | Full UTC ticks plus normalized from, subject, body, and ordered `to` | Cross-mailbox test; fraction tests; sample drops DOC-000009 | Key is not in the spec. Display names, reordered recipients, and body edits beyond line endings do not match |
+| 3.4 Across the batch | One union-find over top-level documents | Sample mixes jsmith and mlee | Same section 4 consequence |
+| 3.5 Family intact | Descendants follow the kept root | Nested `FamilyID`; shared-hash attachments; sample | Suppressed root takes its attachments with it |
+| 3.6 Duplicates omitted | Not written to the CSV | Suppressed counts | — |
+| 4. Custodian set stands alone | Cannot, with this header | Sample lacks mlee's Q3 family and `policy.docx` | Unresolved. Owner must say whether the duplicate family is re-emitted |
+| 5. Header and eight columns | Exact header string; quote only `,`, `"`, CR, LF | Header test; sample line splits; `Write_StoresTheSameTextAsToCsv` | Quote acceptance by ingest is not specified |
+| 5. `FamilyID` / `ParentID` / `SentDate` | Root id; immediate parent; UTC whole second, fraction truncated only on output | Nested test; offset, `Z`, and fraction tests | Truncation rather than rounding is a documented choice |
+| 5. Row order insignificant | Rows sorted by ordinal `DocID` | `InputOrder_DoesNotChangeSurvivorsOrCsv` compares writer text | Disk bytes are covered by the `Write` test, not by the order test |
+| 6.1 Same file for any input order | Winner is minimum `DocID`; rows are sorted | Order test and two orders of the mailbox pair | — |
+| 6.2 About two million documents | Hash map plus union-find; roots memoized | Not run at that size | No measured timing |
+| 6.3 One summary line | Sample process printed the in/out/suppressed line | No unit test around `Main` | — |
 

@@ -4,40 +4,43 @@ Keep this short and honest. Bullet points are fine. We read this before we read 
 
 ## Where the spec was unclear, contradictory, or silent
 
-- **Question:** Sections 3.2 and 3.6 say two attachments with the same `sha256` are duplicates and suppressed duplicates are omitted. Section 3.5 says a family is produced intact, so a reviewer who opens an email sees every attachment that was on it. The sample hits both at once: `vendor-report.pdf` is DOC-000003 on DOC-000001 and DOC-000005 on DOC-000004.
-- **Decision:** Family integrity wins for attachments. A top-level document is still deduplicated by `sha256`. The survivor is the ordinally smallest `DocID` (`StringComparer.Ordinal`), not the first row in the file. A document with a `parentId` is emitted when its top-level ancestor is emitted, and omitted when that ancestor is omitted. The same attachment hash may therefore appear on more than one kept email.
-- **Also considered:** Keep suppressing attachment rows by hash, which is what the previous code did and what a literal reading of 3.2 requires. That is the reported bug: DOC-000004 stayed in the load file and lost its only attachment. Re-parenting the surviving PDF onto every email that had contained it would show the right bytes on the wrong `DocID` / `ParentID`.
-- **Trade-off:** The load file is no longer globally unique by attachment hash. DOC-000003, DOC-000005, and DOC-000011 are three rows with one PDF hash. I did not ask the team; the ticket and section 3.5 describe the reviewer-visible failure, and section 3.2 cannot be satisfied at the same time for two different emails that happen to carry the same file.
-- **Question:** Section 6.1 requires the same load file regardless of input order. Section 5 says row order is not significant. The spec does not say which duplicate wins.
-- **Decision:** Among top-level documents with the same `sha256`, keep the ordinally smallest `DocID`. Emit every surviving row, attachments included, in ascending ordinal `DocID` order. A child may sort before its parent. `ParentID` is still the immediate parent. Loose-file duplicates are still global; only the survivor changed from "first in the file" to "smallest DocID". On the sample, DOC-000008 remains and DOC-000013 is still omitted, because `DOC-000008` is the smaller id.
-- **Not decided here:** Section 3.3 versus section 4 (cross-mailbox copies versus a self-contained custodian set). The fixed CSV has one `Custodian` column, so one surviving row cannot name both custodians. Cross-mailbox email dedup is not implemented. mlee's set is still missing `policy.docx`. That section 4 conflict remains open.
+- **Question:** Sections 3.2 and 3.6 say attachments with the same `sha256` are duplicates and omitted. Section 3.5 says a kept email's family arrives intact.
+- **Decision:** Family integrity wins. Attachment hashes do not suppress attachment rows. A kept root keeps every descendant. The same PDF may appear on more than one kept email (DOC-000003 and DOC-000005).
+- **Question:** Section 3.3 says mailbox copies are duplicates even when `sha256` differs. It does not name the fields. There is no message id. Section 4 says each custodian's set must stand alone. The CSV has one `Custodian` column and the column list cannot grow. Section 3.4 and 3.6 say dedup is across the batch and duplicates are omitted. Section 1 says reviewers do not see the same content twice.
+- **Decision:** One CSV cannot satisfy both. Section 3.3, 3.4, 3.6, and section 1 require the duplicate content to be omitted. Section 4 requires mlee's own copy to remain if mlee is later produced alone. The frozen header has one `Custodian` column, so the kept row cannot also name mlee. Behavior is global omission of the duplicate family: smallest `DocID`, attachments of that copy kept, the other custodian's copy omitted. Sample result: DOC-000001 with DOC-000002 and DOC-000003; DOC-000009, DOC-000010, and DOC-000011 omitted. DOC-000013 still loses to DOC-000008. This does not comply with section 4. Clarification needed from the assessment owner before any other behavior: if a custodian is severed, must that custodian's duplicate family be emitted anyway?
+- **Email key, because the spec is silent:** present `from`, `sentDate`, `subject`, `body`, and `to` only. `from`, `subject`, and each `to` entry are trimmed and lowercased with the invariant culture. The key stores `ToUniversalTime().Ticks` before the CSV second is truncated. `19:22:00.100Z` does not match `19:22:00.200Z`. `19:22:00.500Z` matches `14:22:00.500-05:00`. The timestamp must have an explicit `Z` or numeric offset. `body` converts CR and CRLF to LF, then trims the ends. Internal spaces and blank lines stay. Recipient order stays; the spec does not say order is irrelevant. `Re:` and `FW:` are not stripped. File name, custodian, and raw `sha256` are not the identity. A null `from`, `subject`, `body`, `to`, or `sentDate`, a blank `from`, or an unparseable `sentDate` builds no key, so those emails are not merged with each other unless their raw hashes match. A kept email with a bad `sentDate` still throws on output.
+- **Limitations of that key:** a display name will not match a bare address. A reordered `to` list will not match. A gateway footer or a body-case change will not match. Two messages that really are the same and differ only in those ways stay duplicated. Different sub-second instants stay distinct even though the CSV second is the same.
+- **Question:** Section 6.1 requires the same load file regardless of input order. Section 5 says row order is not significant. The spec does not name the winner.
+- **Decision:** Every equivalence class of top-level documents keeps the ordinal-minimum `DocID`. Classes are equal `sha256` (loose files and emails) union equal email keys. Rows, including attachments, are sorted by `DocID` with `StringComparer.Ordinal`.
+- **Question:** The output `SentDate` may not contain a fraction, and the input is ISO 8601, which may. Rounding was previously unresolved.
+- **Decision:** Accept a whole-second or fractional timestamp with an explicit zone. Emit UTC truncated toward zero to a whole second, so `19:22:00.900Z` stays `19:22:00Z`. A missing zone still throws and is not read as local time.
+- **Question:** Section 5 says the file is a CSV and fixes the header. It does not mention quotes. The sample fields have no comma, quote, or line break.
+- **Decision:** Quote a field only when it contains `,`, `"`, CR, or LF, and double internal quotes. Plain fields, including `Q3 budget review.eml` and empty columns, stay unquoted, so this sample's column text does not gain quote marks. This is an assumption that the ingest job accepts quoted fields. The spec does not name RFC 4180. Header text and column order are unchanged.
 
 ## What I changed and why
 
-- `Deduper` no longer puts every document through one hash set. Top-level documents (`parentId` null), including loose files and emails, still collapse by `sha256`. The kept id is the ordinal minimum, so a later smaller `DocID` wins over an earlier larger one. A second email is dropped only when the raw hash actually matches.
-- Attachments follow the parent chain. Shared hashes across kept families stay. Attachments of a suppressed top-level document are suppressed with it, so the load file does not gain orphaned children.
-- A parent cycle throws instead of hanging. The spec says the parent is always present and says nothing about cycles.
-- `FamilyID` is the top-level document's `docId` for every row in that family, including a nested attachment. `ParentID` stays the immediate parent. This is section 5, which already stated it; the previous code used one parent hop.
-- `SentDate` is the root document's timestamp written as `yyyy-MM-ddTHH:mm:ssZ`. Tests verify `2024-03-05T19:22:00Z` stays that string, and `2024-03-05T14:22:00-05:00` becomes `2024-03-05T19:22:00Z`. Attachments use the root email's instant. A nested attachment's `FamilyID` is the top-level id. Loose files stay empty, including a loose file that carries a timestamp string. The format specifier `K` treats a missing offset as the machine's local zone. The code now rejects that shape before parsing. `2024-03-05T19:22:00` throws `InvalidOperationException`. The test asserts the throw and does not encode a local offset, so the expected result is the same in every timezone. Fractional seconds still do not match the whole-second pattern. No rounding or truncation rule is chosen, and no test defines one.
-- Surviving rows are sorted by `DocID` with `StringComparer.Ordinal` before the CSV is written. Tests compare `LoadFileWriter.ToCsv` across several input orders and require the same text. That is identical CSV text from the writer. It is not a check of the bytes `File.WriteAllText` puts on disk.
-- Command line, summary sentence, header, and column order are unchanged.
+- Cross-mailbox emails with a complete key collapse even when `sha256` differs. The kept email keeps its attachments. The other copy's family is omitted.
+- Loose-file dedup is still global `sha256` plus ordinal `DocID`. DOC-000013 is still omitted.
+- Attachment hashes still do not strip a kept family. DOC-000004 still has `vendor-report.pdf`.
+- Parent cycles throw. Each document's root is memoized, so a batch is one pass over documents plus parent links, not a pairwise comparison.
+- Fractional input is truncated only when formatting `SentDate`. Identity uses the full UTC tick count.
+- The CSV writer quotes only fields that need it.
 
 ## What I didn't get to
 
-- Cross-mailbox email identity (section 3.3). DOC-000001 and DOC-000009 both remain. The spec does not define the match key, and there is no message id on the document.
-- Section 4 for loose files. Dedup is still global. The sample still omits DOC-000013.
-- CSV quoting. The sample's output fields have no comma, quote, or newline.
-- Input the spec says will not happen: missing parent, duplicate `docId`, empty `sha256`.
+- Section 4 for the losing custodian. Waiting on the clarification above. The schema cannot record both custodians on one row.
+- Display-name parsing, recipient reordering, and body changes beyond line endings and surrounding trim.
 
 ## What I'd do next
 
-- Write down the email match key and whether dedup is per custodian or per batch before coding section 3.3. A key that strips `FW:` / `Re:` or compares raw bodies would collapse DOC-000004 or DOC-000012 into the Q3 email; those are different messages in the sample.
-- Decide section 4 for loose files separately. The current CSV cannot list both custodians on DOC-000008. Do not treat `data/current-tool-output.csv` as the oracle; it is the attachment-loss baseline (16 in, 12 out, 4 suppressed).
+- Ask whether a severed custodian must receive the duplicate family anyway. That choice contradicts 3.3 inside this CSV.
+- Ask the ingest job whether quoted fields are accepted before relying on them for unseen batches.
+- Do not treat `data/current-tool-output.csv` as the oracle. It is the pre-fix baseline (16 in, 12 out, 4 suppressed) from before family integrity.
 
 ## If you reimplemented in another language
 
-Stayed on .NET 8. The command is still `DedupTool <batch.json> <loadfile.csv>`, the summary sentence is unchanged, and the header is still `DocID,FamilyID,ParentID,Custodian,DocType,FileName,SentDate,Hash`.
+Stayed on .NET 8. The command is still `DedupTool <batch.json> <loadfile.csv>`. The summary sentence is unchanged. The header is still `DocID,FamilyID,ParentID,Custodian,DocType,FileName,SentDate,Hash`.
 
 ## Working with the AI
 
-The review correctly separated the hash-set bug from unimplemented section 3.3, and the reversal run showed the survivor set really does depend on order. I rejected treating a normalized from/subject/body key as a requirement: the spec never defines it. The implementation follows the written choice (keep attachment rows on every kept email, do not dedupe mailbox copies yet) rather than a literal reading of section 3.2.
+Earlier passes kept mailbox copies apart until the key and the section 4 trade-off were written down. The key does not strip `Re:` or `FW:`. Recipient order is not sorted, because the spec never says order is irrelevant.
